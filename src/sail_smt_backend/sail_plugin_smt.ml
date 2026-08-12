@@ -48,6 +48,7 @@ open Libsail
 
 open Jib_smt
 open Interactive.State
+open Ast_compare
 
 let opt_smt_auto = ref false
 let opt_smt_auto_solver = ref Smt_exp.Cvc5
@@ -57,6 +58,7 @@ let opt_smt_specialize = ref true
 let opt_smt_unknown_integer_width = ref 128
 let opt_smt_unknown_bitvector_width = ref 64
 let opt_smt_unknown_generic_vector_width = ref 32
+let opt_smt_transition : string option ref = ref None
 
 let set_smt_auto_solver arg =
   let open Smt_exp in
@@ -100,6 +102,11 @@ let smt_options =
       Arg.Clear opt_smt_specialize,
       "Disable generic specialization when generating SMT"
     );
+    ( Flag.create ~prefix:["smt"] ~arg:"fn" "transition",
+      Arg.String (fun fn -> opt_smt_transition := Some fn),
+      "emit the given function's SMT transition relation, as a single quantifier-free define-fun with pre-state, \
+       arguments, and post-state as its parameters. Mutually exclusive with $property/$counterexample."
+    );
   ]
 
 let smt_rewrites =
@@ -131,12 +138,13 @@ let smt_rewrites =
     ("properties", []);
   ]
 
-let smt_target out_file { ast; effect_info; env = orig_env; _ } =
-  let open Ast_compare in
-  let properties = Property.find_properties ast in
-  let prop_ids = Bindings.bindings properties |> List.map fst |> IdSet.of_list in
-  let ast = Callgraph.filter_ast_ids prop_ids IdSet.empty ast in
-  Specialize.add_initial_calls prop_ids;
+(* Slice to root_ids, specialize, and compile to Jib - the part of the smt
+   target's pipeline shared between the $property path and the
+   -smt_transition path, which otherwise differ in what they slice to and
+   how they turn the resulting cdefs into SMT. *)
+let compile_for_smt out_file orig_env effect_info ast root_ids =
+  let ast = Callgraph.filter_ast_ids root_ids IdSet.empty ast in
+  Specialize.add_initial_calls root_ids;
   let ast_smt, env, effect_info =
     if !opt_smt_specialize then (
       let ast_smt, env, effect_info = Specialize.(specialize typ_specialization orig_env ast effect_info) in
@@ -149,39 +157,64 @@ let smt_target out_file { ast; effect_info; env = orig_env; _ } =
   in
   Reporting.opt_warnings := true;
   let cdefs, ctx, register_map = Jib_smt.compile ~unroll_limit:10 env effect_info ast_smt in
-  let module SMTGen = Jib_smt.Make (struct
-    let max_unknown_integer_width = !opt_smt_unknown_integer_width
-    let max_unknown_bitvector_width = !opt_smt_unknown_bitvector_width
-    let max_unknown_generic_vector_length = !opt_smt_unknown_generic_vector_width
-    let register_map = register_map
-    let ignore_overflow = !opt_smt_ignore_overflow
-  end) in
-  let module Counterexample = Smt_exp.Counterexample (struct
-    let max_unknown_integer_width = !opt_smt_unknown_integer_width
-  end) in
-  let t = Profile.start () in
-  let generated_smt = SMTGen.generate_smt ~properties ~name_file ~smt_includes:!opt_smt_includes ctx cdefs in
-  Profile.finish "Generating SMT" t;
-  if !opt_smt_auto then (
-    let unsats =
-      List.map
-        (fun ({ loc; file_name; function_id; args; arg_ctyps; arg_smt_names } : SMTGen.generated_smt_info) ->
-          ( Counterexample.check ~loc ~ctx ~env:orig_env ~ast ~solver:!opt_smt_auto_solver ~file_name ~function_id ~args
-              ~arg_ctyps ~arg_smt_names,
-            function_id
+  (ctx, cdefs, register_map, name_file)
+
+let resolve_transition_id ast name =
+  let id = Ast_util.mk_id name in
+  if IdSet.mem id (Ast_util.val_spec_ids ast.Ast_defs.defs) then id
+  else raise (Reporting.err_general Parse_ast.Unknown ("Could not find function " ^ name ^ " for -smt_transition"))
+
+let smt_target out_file { ast; effect_info; env = orig_env; _ } =
+  match !opt_smt_transition with
+  | None ->
+      let properties = Property.find_properties ast in
+      let prop_ids = Bindings.bindings properties |> List.map fst |> IdSet.of_list in
+      let ctx, cdefs, register_map, name_file = compile_for_smt out_file orig_env effect_info ast prop_ids in
+      let module SMTGen = Jib_smt.Make (struct
+        let max_unknown_integer_width = !opt_smt_unknown_integer_width
+        let max_unknown_bitvector_width = !opt_smt_unknown_bitvector_width
+        let max_unknown_generic_vector_length = !opt_smt_unknown_generic_vector_width
+        let register_map = register_map
+        let ignore_overflow = !opt_smt_ignore_overflow
+      end) in
+      let module Counterexample = Smt_exp.Counterexample (struct
+        let max_unknown_integer_width = !opt_smt_unknown_integer_width
+      end) in
+      let t = Profile.start () in
+      let generated_smt = SMTGen.generate_smt ~properties ~name_file ~smt_includes:!opt_smt_includes ctx cdefs in
+      Profile.finish "Generating SMT" t;
+      if !opt_smt_auto then (
+        let unsats =
+          List.map
+            (fun ({ loc; file_name; function_id; args; arg_ctyps; arg_smt_names } : SMTGen.generated_smt_info) ->
+              ( Counterexample.check ~loc ~ctx ~env:orig_env ~ast ~solver:!opt_smt_auto_solver ~file_name ~function_id
+                  ~args ~arg_ctyps ~arg_smt_names,
+                function_id
+              )
+            )
+            generated_smt
+        in
+        List.iter
+          (fun (u, fid) ->
+            if u = false then (
+              let l, tf = (Ast_util.id_loc fid, Ast_util.string_of_id fid) in
+              raise (Reporting.err_general l ("Property check failure for " ^ tf ^ "."))
+            )
           )
-        )
-        generated_smt
-    in
-    List.iter
-      (fun (u, fid) ->
-        if u = false then (
-          let l, tf = (Ast_util.id_loc fid, Ast_util.string_of_id fid) in
-          raise (Reporting.err_general l ("Property check failure for " ^ tf ^ "."))
-        )
+          unsats
       )
-      unsats
-  );
-  ()
+  | Some name ->
+      let id = resolve_transition_id ast name in
+      let ctx, cdefs, register_map, name_file =
+        compile_for_smt out_file orig_env effect_info ast (IdSet.singleton id)
+      in
+      let module SMTGen = Jib_smt.Make (struct
+        let max_unknown_integer_width = !opt_smt_unknown_integer_width
+        let max_unknown_bitvector_width = !opt_smt_unknown_bitvector_width
+        let max_unknown_generic_vector_length = !opt_smt_unknown_generic_vector_width
+        let register_map = register_map
+        let ignore_overflow = !opt_smt_ignore_overflow
+      end) in
+      SMTGen.generate_transition ~name_file ctx cdefs name
 
 let _ = Target.register ~name:"smt" ~options:smt_options ~rewrites:smt_rewrites smt_target

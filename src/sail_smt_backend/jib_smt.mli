@@ -82,6 +82,24 @@ module Make (Config : CONFIG) : sig
     Jib_compile.ctx ->
     cdef list ->
     generated_smt_info list
+
+  (** Generate the SMT transition relation for a single named function, as one quantifier-free [define-fun] of type
+      [Bool] named after the function. Its parameters are, in order:
+      - each architectural register's pre-state value, named after the register (zencoded, e.g. [zR1]),
+      - each function argument, named after its Sail-level parameter name,
+      - each architectural register's post-state value, named [<register>_next],
+      - a [Bool] parameter per side condition that can actually occur - [overflow], [assertion_failure],
+        [match_failure] - omitted entirely when it cannot occur.
+
+      The body is a flat conjunction of equalities, one per post-state/side-condition parameter, each pinning it to
+      its computed value (every intermediate value from the underlying SSA walk is inlined by substitution, since
+      Smt_exp has no let-binding node). *)
+  val generate_transition :
+    name_file:(string -> string) (** Applied to the function name to generate the file name for the smtlib file *) ->
+    Jib_compile.ctx ->
+    cdef list ->
+    string ->
+    unit
 end
 
 val compile :
