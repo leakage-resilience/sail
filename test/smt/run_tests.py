@@ -5,7 +5,6 @@ import re
 import subprocess
 import sys
 import hashlib
-import json
 import shutil
 
 
@@ -77,13 +76,20 @@ def test_smt_transition():
     banner('Testing SMT: -smt_transition')
     results = Results('smt_transition')
     test = 'transition_step'
+    stale_sidecar = '{}_step.smt2.interface.json'.format(test)
+    if os.path.exists(stale_sidecar):
+        os.remove(stale_sidecar)
 
     step('\'{}\' -smt -smt_transition step {}.sail -o {}'.format(sail, test, test))
 
     with open('{}_step.smt2'.format(test)) as f:
         smt2 = f.read()
-    with open('{}_step.smt2.interface.json'.format(test)) as f:
-        interface = json.load(f)
+
+    metadata = re.findall(
+        r'^\(set-info :sail-transition-parameter-(\d+)-([a-z-]+) "([^"]*)"\)$',
+        smt2,
+        re.MULTILINE,
+    )
 
     checks = {
         'one_define_fun_named_step': smt2.count('(define-fun step ') == 1,
@@ -96,9 +102,13 @@ def test_smt_transition():
         'next_params_present': '(zR1_next (_ BitVec 16))' in smt2 and '(zR2_next (_ BitVec 8))' in smt2,
         'result_param_present': '(zreturn_value Bool)' in smt2,
         'no_spurious_side_conditions': 'overflow' not in smt2 and 'assertion_failure' not in smt2 and 'match_failure' not in smt2,
-        'interface_schema': interface['schema'] == 'sail_smt_transition_interface' and interface['schema_version'] == 1,
-        'interface_roles': [parameter['role'] for parameter in interface['parameters']]
-        == ['state_pre', 'state_pre', 'input', 'state_post', 'state_post', 'result'],
+        'interface_version': '(set-info :sail-transition-interface-version 1)' in smt2,
+        'interface_transition': '(set-info :sail-transition "step")' in smt2,
+        'interface_precedes_relation': smt2.index(':sail-transition-interface-version') < smt2.index('(define-fun step '),
+        'interface_roles': [role for _, role, _ in metadata]
+        == ['state-pre', 'state-pre', 'input', 'state-post', 'state-post', 'result'],
+        'interface_sources': [source for _, _, source in metadata] == ['R1', 'R2', 'x', 'R1', 'R2', 'result'],
+        'no_interface_sidecar': not os.path.exists(stale_sidecar),
         'correct_instantiation_is_sat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x1234 #x00 true))') == 'sat',
         'wrong_instantiation_is_unsat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x0000 #x00 true))') == 'unsat',
         'wrong_result_is_unsat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x1234 #x00 false))') == 'unsat',
@@ -138,6 +148,7 @@ def test_smt_transition_match_failure():
 
     checks = {
         'match_failure_param_present': '(zmatch_failure Bool)' in smt2,
+        'match_failure_role_present': ':sail-transition-parameter-3-side-condition "match_failure"' in smt2,
         'no_overflow_or_assertion_params': 'overflow' not in smt2 and 'assertion_failure' not in smt2,
         'no_assert_no_check_sat': '(assert' not in smt2 and '(check-sat)' not in smt2,
         'no_quantifiers': 'exists' not in smt2 and 'forall' not in smt2,

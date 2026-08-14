@@ -78,8 +78,7 @@ http://www.cl.cam.ac.uk/~pes20/sail/.
   (name sail_smt_backend)
   (synopsis "Sail to SMT translation")
   (depends
-    (libsail (= :version))
-    yojson))
+    (libsail (= :version))))
 
 (package
   (name sail_sv_backend)

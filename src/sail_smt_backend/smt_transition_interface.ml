@@ -4,48 +4,31 @@
 (*  SPDX-License-Identifier: BSD-2-Clause                                   *)
 (****************************************************************************)
 
-(** Machine-readable interface for an SMT transition relation. The SMT parameter name is an implementation detail;
-    [source_name] and [role] provide the stable meaning consumed by verification tools. *)
+(** Machine-readable interface metadata embedded in an SMT transition artifact. Formal names and sorts remain
+    authoritative in the adjacent [define-fun]; [source_name] and [role] provide the stable source-level meaning. *)
 type role = State_pre | Input | Nondet_input | State_post | Result | Side_condition
 
-type parameter = { position : int; source_name : string option; smt_name : string; smt_sort : string; role : role }
-
-let manifest_file_name smt_file = smt_file ^ ".interface.json"
+type parameter = { position : int; source_name : string option; role : role }
 
 let string_of_role = function
-  | State_pre -> "state_pre"
+  | State_pre -> "state-pre"
   | Input -> "input"
-  | Nondet_input -> "nondet_input"
-  | State_post -> "state_post"
+  | Nondet_input -> "nondet-input"
+  | State_post -> "state-post"
   | Result -> "result"
-  | Side_condition -> "side_condition"
+  | Side_condition -> "side-condition"
 
-let json_of_parameter { position; source_name; smt_name; smt_sort; role } =
-  `Assoc
-    [
-      ("position", `Int position);
-      ("source_name", match source_name with Some name -> `String name | None -> `Null);
-      ("smt_name", `String smt_name);
-      ("smt_sort", `String smt_sort);
-      ("role", `String (string_of_role role));
-    ]
+(* SMT-LIB strings escape a quote by doubling it. Source-level Sail names do
+   not normally contain quotes, but doing this here keeps the format complete. *)
+let quote_string value = "\"" ^ String.concat "\"\"" (String.split_on_char '"' value) ^ "\""
 
-let to_json ~smt_file ~transition parameters =
-  `Assoc
-    [
-      ("schema", `String "sail_smt_transition_interface");
-      ("schema_version", `Int 1);
-      ("transition", `String transition);
-      ("smt_file", `String (Filename.basename smt_file));
-      ("parameters", `List (List.map json_of_parameter parameters));
-    ]
-
-let write ~smt_file ~transition parameters =
-  let file_name = manifest_file_name smt_file in
-  let channel = open_out_bin file_name in
-  Fun.protect
-    ~finally:(fun () -> close_out_noerr channel)
-    (fun () ->
-      Yojson.Safe.pretty_to_channel ~std:true channel (to_json ~smt_file ~transition parameters);
-      output_char channel '\n'
+let write channel ~transition parameters =
+  output_string channel "; Sail transition interface; metadata order matches the define-fun parameters below.\n";
+  output_string channel "(set-info :sail-transition-interface-version 1)\n";
+  Printf.fprintf channel "(set-info :sail-transition %s)\n" (quote_string transition);
+  List.iter
+    (fun { position; source_name; role } ->
+      Printf.fprintf channel "(set-info :sail-transition-parameter-%d-%s %s)\n" position (string_of_role role)
+        (quote_string (Option.value ~default:"" source_name))
     )
+    parameters

@@ -12,7 +12,7 @@
  (modes
   (native plugin)
   (byte plugin))
- (libraries libsail yojson))
+ (libraries libsail))
 
 (install
  (section

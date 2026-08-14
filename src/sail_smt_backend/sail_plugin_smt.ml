@@ -156,7 +156,7 @@ let smt_options =
       Arg.String (fun fn -> opt_smt_transition := Some fn),
       "emit the given function's SMT transition relation, as a single quantifier-free define-fun with pre-state, \
        arguments, post-state, result, and side conditions as its parameters, plus a machine-readable interface \
-       manifest. Mutually exclusive with $property/$counterexample."
+       embedded with standard SMT-LIB set-info commands. Mutually exclusive with $property/$counterexample."
     );
   ]
 
@@ -275,9 +275,6 @@ let smt_target out_file { ast; effect_info; env = orig_env; _ } =
         let register_map = register_map
         let ignore_overflow = !opt_smt_ignore_overflow
       end) in
-      let ({ file_name; function_id; parameters } : SMTGen.generated_transition_info) =
-        SMTGen.generate_transition ~name_file ~arg_source_names ctx cdefs name
-      in
-      Smt_transition_interface.write ~smt_file:file_name ~transition:(Ast_util.string_of_id function_id) parameters
+      ignore (SMTGen.generate_transition ~name_file ~arg_source_names ctx cdefs name)
 
 let _ = Target.register ~name:"smt" ~options:smt_options ~rewrites:smt_rewrites smt_target

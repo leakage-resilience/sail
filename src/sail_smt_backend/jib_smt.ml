@@ -856,11 +856,7 @@ module Make (Config : CONFIG) = struct
     arg_smt_names : (name * string option) list;
   }
 
-  type generated_transition_info = {
-    file_name : string;
-    function_id : id;
-    parameters : Smt_transition_interface.parameter list;
-  }
+  type generated_transition_info = { file_name : string; function_id : id }
 
   let smt_cdef props lets name_file ctx all_cdefs smt_includes (CDEF_aux (aux, def_annot)) =
     match aux with
@@ -1349,6 +1345,22 @@ module Make (Config : CONFIG) = struct
     in
     reject_duplicate parameter_names;
 
+    let parameter_data =
+      List.map (fun (reg, _, _, _) -> (Smt_transition_interface.State_pre, Some (register_label reg))) register_bounds
+      @ List.map2 (fun source_name _ -> (Smt_transition_interface.Input, source_name)) arg_source_names arg_bindings
+      @ List.map (fun _ -> (Smt_transition_interface.Nondet_input, None)) extra_params
+      @ List.map
+          (fun (reg, _, _, _) -> (Smt_transition_interface.State_post, Some (register_label reg)))
+          register_bounds
+      @ List.map (fun _ -> (Smt_transition_interface.Result, Some "result")) result_params
+      @ List.map (fun (label, _) -> (Smt_transition_interface.Side_condition, Some label)) side_conditions
+    in
+    let parameters =
+      List.mapi
+        (fun position (role, source_name) -> Smt_transition_interface.{ position; source_name; role })
+        parameter_data
+    in
+
     let fname = name_file name in
     let out_chan = open_out fname in
     let header, _ = Smt_gen.run (smt_header all_cdefs) Parse_ast.Unknown ctx in
@@ -1358,51 +1370,11 @@ module Make (Config : CONFIG) = struct
         output_string out_chan "\n"
       )
       header;
+    Smt_transition_interface.write out_chan ~transition:(Ast_util.string_of_id function_id) parameters;
     output_string out_chan (string_of_smt_def (Define_fun (name, params, Bool, body)));
     output_string out_chan "\n";
     close_out out_chan;
-
-    let parameter role source_name (smt_name, smt_type) =
-      (role, source_name, smt_name, Smt_exp.string_of_smt_typ smt_type)
-    in
-    let parameter_data =
-      List.map
-        (fun (reg, ty, _, _) ->
-          parameter Smt_transition_interface.State_pre
-            (Some (register_label reg))
-            (zencode_name (clean_id (register_label reg)), ty)
-        )
-        register_bounds
-      @ List.map2
-          (fun source_name (decl_name, ty, _) ->
-            parameter Smt_transition_interface.Input source_name (zencode_name (clean_id (arg_label decl_name)), ty)
-          )
-          arg_source_names arg_bindings
-      @ List.map
-          (fun (smt_name, ty) -> parameter Smt_transition_interface.Nondet_input None (smt_name, ty))
-          extra_params
-      @ List.map
-          (fun (reg, ty, _, _) ->
-            parameter Smt_transition_interface.State_post
-              (Some (register_label reg))
-              (zencode_name (clean_id (register_label reg ^ "_next")), ty)
-          )
-          register_bounds
-      @ List.map (fun result -> parameter Smt_transition_interface.Result (Some "result") result) result_params
-      @ List.map
-          (fun (label, _) ->
-            parameter Smt_transition_interface.Side_condition (Some label) (zencode_name (clean_id label), Bool)
-          )
-          side_conditions
-    in
-    let parameters =
-      List.mapi
-        (fun position (role, source_name, smt_name, smt_sort) ->
-          Smt_transition_interface.{ position; source_name; smt_name; smt_sort; role }
-        )
-        parameter_data
-    in
-    { file_name = fname; function_id; parameters }
+    { file_name = fname; function_id }
 end
 
 module CompileConfig (Opts : sig
