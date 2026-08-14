@@ -46,6 +46,7 @@
 
 open Libsail
 
+open Ast
 open Jib_smt
 open Interactive.State
 open Ast_compare
@@ -59,6 +60,55 @@ let opt_smt_unknown_integer_width = ref 128
 let opt_smt_unknown_bitvector_width = ref 64
 let opt_smt_unknown_generic_vector_width = ref 32
 let opt_smt_transition : string option ref = ref None
+
+let rec source_argument_name (P_aux (pattern, _)) =
+  match pattern with
+  | P_id id -> Some (Ast_util.string_of_id id)
+  | P_as (pattern, id) -> (
+      match source_argument_name pattern with
+      | Some _ as name -> name
+      | None when not (Reporting.is_unknown_loc (Ast_util.id_loc id)) -> Some (Ast_util.string_of_id id)
+      | None -> None
+    )
+  | P_typ (_, pattern) | P_var (pattern, _) -> source_argument_name pattern
+  | _ -> None
+
+let function_clause_argument_names (FCL_aux (FCL_funcl (_, pexp), _)) =
+  let pattern, _, _, _ = Ast_util.destruct_pexp pexp in
+  match pattern with
+  | P_aux (P_tuple patterns, _) -> List.map source_argument_name patterns
+  | pattern -> [source_argument_name pattern]
+
+let same_source_name name1 name2 =
+  match (name1, name2) with Some name1, Some name2 -> String.equal name1 name2 | None, None -> true | _ -> false
+
+let merge_clause_argument_names = function
+  | [] -> []
+  | names :: remaining ->
+      List.mapi
+        (fun index name ->
+          if
+            List.for_all
+              (fun other_names ->
+                match List.nth_opt other_names index with
+                | Some other_name -> same_source_name name other_name
+                | None -> false
+              )
+              remaining
+          then name
+          else None
+        )
+        names
+
+let transition_argument_names function_id (ast : Type_check.typed_ast) =
+  List.find_map
+    (function
+      | DEF_aux (DEF_fundef (FD_aux (FD_function (_, _, clauses), _) as fundef), _)
+        when Id.compare (Ast_util.id_of_fundef fundef) function_id = 0 ->
+          Some (merge_clause_argument_names (List.map function_clause_argument_names clauses))
+      | _ -> None
+      )
+    ast.defs
 
 let set_smt_auto_solver arg =
   let open Smt_exp in
@@ -105,7 +155,8 @@ let smt_options =
     ( Flag.create ~prefix:["smt"] ~arg:"fn" "transition",
       Arg.String (fun fn -> opt_smt_transition := Some fn),
       "emit the given function's SMT transition relation, as a single quantifier-free define-fun with pre-state, \
-       arguments, and post-state as its parameters. Mutually exclusive with $property/$counterexample."
+       arguments, post-state, result, and side conditions as its parameters, plus a machine-readable interface \
+       manifest. Mutually exclusive with $property/$counterexample."
     );
   ]
 
@@ -205,6 +256,15 @@ let smt_target out_file { ast; effect_info; env = orig_env; _ } =
       )
   | Some name ->
       let id = resolve_transition_id ast name in
+      let arg_source_names =
+        match transition_argument_names id ast with
+        | Some names -> names
+        | None ->
+            raise
+              (Reporting.err_general (Ast_util.id_loc id)
+                 ("Could not recover source argument names for transition " ^ name)
+              )
+      in
       let ctx, cdefs, register_map, name_file =
         compile_for_smt out_file orig_env effect_info ast (IdSet.singleton id)
       in
@@ -215,6 +275,9 @@ let smt_target out_file { ast; effect_info; env = orig_env; _ } =
         let register_map = register_map
         let ignore_overflow = !opt_smt_ignore_overflow
       end) in
-      SMTGen.generate_transition ~name_file ctx cdefs name
+      let ({ file_name; function_id; parameters } : SMTGen.generated_transition_info) =
+        SMTGen.generate_transition ~name_file ~arg_source_names ctx cdefs name
+      in
+      Smt_transition_interface.write ~smt_file:file_name ~transition:(Ast_util.string_of_id function_id) parameters
 
 let _ = Target.register ~name:"smt" ~options:smt_options ~rewrites:smt_rewrites smt_target

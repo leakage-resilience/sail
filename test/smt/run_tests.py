@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import hashlib
+import json
 import shutil
 
 
@@ -81,6 +82,8 @@ def test_smt_transition():
 
     with open('{}_step.smt2'.format(test)) as f:
         smt2 = f.read()
+    with open('{}_step.smt2.interface.json'.format(test)) as f:
+        interface = json.load(f)
 
     checks = {
         'one_define_fun_named_step': smt2.count('(define-fun step ') == 1,
@@ -91,14 +94,19 @@ def test_smt_transition():
         'register_params_present': '(zR1 (_ BitVec 16))' in smt2 and '(zR2 (_ BitVec 8))' in smt2,
         'argument_param_present': '(zx (_ BitVec 16))' in smt2,
         'next_params_present': '(zR1_next (_ BitVec 16))' in smt2 and '(zR2_next (_ BitVec 8))' in smt2,
+        'result_param_present': '(zreturn_value Bool)' in smt2,
         'no_spurious_side_conditions': 'overflow' not in smt2 and 'assertion_failure' not in smt2 and 'match_failure' not in smt2,
-        'correct_instantiation_is_sat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x1234 #x00))') == 'sat',
-        'wrong_instantiation_is_unsat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x0000 #x00))') == 'unsat',
+        'interface_schema': interface['schema'] == 'sail_smt_transition_interface' and interface['schema_version'] == 1,
+        'interface_roles': [parameter['role'] for parameter in interface['parameters']]
+        == ['state_pre', 'state_pre', 'input', 'state_post', 'state_post', 'result'],
+        'correct_instantiation_is_sat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x1234 #x00 true))') == 'sat',
+        'wrong_instantiation_is_unsat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x0000 #x00 true))') == 'unsat',
+        'wrong_result_is_unsat': z3_check(smt2, '(assert (step #x0000 #x00 #x1234 #x1234 #x00 false))') == 'unsat',
         'negated_relation_over_free_state_is_unsat': z3_check(
             smt2,
             '(declare-const r1 (_ BitVec 16)) (declare-const r2 (_ BitVec 8)) (declare-const x (_ BitVec 16))'
             ' (declare-const r1n (_ BitVec 16)) (declare-const r2n (_ BitVec 8))'
-            ' (assert (step r1 r2 x r1n r2n)) (assert (not (and (= r1n x) (= r2n #x00))))'
+            ' (assert (step r1 r2 x r1n r2n true)) (assert (not (and (= r1n x) (= r2n #x00))))'
         )
         == 'unsat',
     }
@@ -171,4 +179,3 @@ xml += '</testsuites>\n'
 output = open('tests.xml', 'w')
 output.write(xml)
 output.close()
-

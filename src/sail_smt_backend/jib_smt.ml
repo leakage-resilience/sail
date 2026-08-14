@@ -189,6 +189,7 @@ module EventMap = Map.Make (Event)
 
 type state = {
   events : smt_exp Stack.t EventMap.t ref;
+  return_values : (smt_exp * smt_exp) Stack.t;
   node : int;
   cfg : (Jib_ssa.ssa_elem list * Jib_ssa.cf_node) Jib_ssa.array_graph;
   arg_stack : (int * string) Stack.t;
@@ -462,6 +463,13 @@ module Make (Config : CONFIG) = struct
     Stack.push pathcond (event_stack state ev);
     return ()
 
+  let add_return state value =
+    let* pathcond = get_pathcond state.node state.cfg in
+    Stack.push (pathcond, value) state.return_values;
+    (* Preserve the existing Boolean-property interpretation of Return. *)
+    Stack.push (Fn ("and", [pathcond; value])) (event_stack state Return);
+    return ()
+
   let define_const id ctyp exp =
     let* ty = smt_ctyp ctyp in
     return (Define_const (id, ty, exp))
@@ -634,7 +642,7 @@ module Make (Config : CONFIG) = struct
   let smt_terminator ctx state =
     let open Jib_ssa in
     function
-    | T_end id -> add_event state Return (Var id)
+    | T_end id -> add_return state (Var id)
     | T_exit _ -> add_pathcond_event state Match
     | T_undefined _ | T_goto _ | T_jump _ | T_label _ | T_none -> return ()
 
@@ -742,7 +750,9 @@ module Make (Config : CONFIG) = struct
     in
     if Option.is_some debug_attr && not (debug_attr_skip_graph debug_attr) then dump_graph name cfg;
 
-    let state = { events = ref EventMap.empty; cfg; node = -1; arg_stack = Stack.create () } in
+    let state =
+      { events = ref EventMap.empty; return_values = Stack.create (); cfg; node = -1; arg_stack = Stack.create () }
+    in
 
     let phivars = ref (-1) in
     let phivar () =
@@ -844,6 +854,12 @@ module Make (Config : CONFIG) = struct
     args : name list;
     arg_ctyps : ctyp list;
     arg_smt_names : (name * string option) list;
+  }
+
+  type generated_transition_info = {
+    file_name : string;
+    function_id : id;
+    parameters : Smt_transition_interface.parameter list;
   }
 
   let smt_cdef props lets name_file ctx all_cdefs smt_includes (CDEF_aux (aux, def_annot)) =
@@ -1058,7 +1074,8 @@ module Make (Config : CONFIG) = struct
   (* Mirrors find_function, but locates a function by plain name via its
      CDEF_val rather than by id via a props map. *)
   let rec find_val_spec lets fn_name = function
-    | CDEF_aux (CDEF_val (id, _, arg_ctyps, _, _), _) :: _ when string_of_id id = fn_name -> Some (lets, id, arg_ctyps)
+    | CDEF_aux (CDEF_val (id, _, arg_ctyps, ret_ctyp, _), _) :: _ when string_of_id id = fn_name ->
+        Some (lets, id, arg_ctyps, ret_ctyp)
     | CDEF_aux (CDEF_let (_, vars, setup), _) :: cdefs ->
         let vars = List.map (fun (id, ctyp) -> idecl (id_loc id) ctyp (name id)) vars in
         find_val_spec (lets @ vars @ setup) fn_name cdefs
@@ -1070,14 +1087,15 @@ module Make (Config : CONFIG) = struct
      structural Jib.name equality so it applies uniformly regardless of
      which mechanism found the replacement (SSA base-name matching for
      registers, the arg_stack for arguments). *)
-  let subst_vars table = fold_smt_exp (function Var v -> Option.value ~default:(Var v) (List.assoc_opt (zencode_name v) table) | e -> e)
+  let subst_vars table =
+    fold_smt_exp (function Var v -> Option.value ~default:(Var v) (List.assoc_opt (zencode_name v) table) | e -> e)
 
   (* Generate a function's SMT transition relation: a single quantifier-free
      define-fun asserting how its post-state (and any side conditions) relate
      to its pre-state and arguments. See jib_smt.mli for the exact shape. *)
-  let generate_transition ~name_file ctx cdefs name =
+  let generate_transition ~name_file ~arg_source_names ctx cdefs name =
     let all_cdefs = visit_cdefs (new expand_reg_deref_visitor ctx.tc_env) cdefs in
-    let lets, function_id, arg_ctyps =
+    let lets, function_id, arg_ctyps, ret_ctyp =
       match find_val_spec [] name all_cdefs with
       | Some v -> v
       | None ->
@@ -1088,6 +1106,11 @@ module Make (Config : CONFIG) = struct
       | intervening_lets, Some (Return_plain, args, instrs, _) -> (intervening_lets, args, instrs)
       | _ -> raise (Reporting.err_general Parse_ast.Unknown ("No function body found for " ^ name))
     in
+    if List.compare_lengths arg_source_names args <> 0 then
+      raise
+        (Reporting.err_general Parse_ast.Unknown
+           (Printf.sprintf "Could not recover all source arguments for transition %s" name)
+        );
     let arg_decls = List.map2 (fun id ctyp -> idecl (unique Parse_ast.Unknown) ctyp id) args arg_ctyps in
     let full_instrs =
       let open Jib_optimize in
@@ -1107,7 +1130,7 @@ module Make (Config : CONFIG) = struct
     (* For each register, the lowest (pre-state) and highest (post-state)
        SSA'd occurrence among the stack entries, matched by base name. *)
     let register_bounds =
-      List.filter_map
+      List.map
         (fun reg ->
           let base, _ = Jib_ssa.unssa_name reg in
           let matches =
@@ -1121,14 +1144,22 @@ module Make (Config : CONFIG) = struct
               entries
           in
           match matches with
-          | [] -> None
+          | [] ->
+              raise
+                (Reporting.err_general Parse_ast.Unknown
+                   (Printf.sprintf "Could not recover transition values for register %s"
+                      (string_of_name ~zencode:false reg)
+                   )
+                )
           | first :: _ ->
               let pick cmp =
-                List.fold_left (fun (bn, bty, bi) (n, ty, i) -> if cmp i bi then (n, ty, i) else (bn, bty, bi)) first matches
+                List.fold_left
+                  (fun (bn, bty, bi) (n, ty, i) -> if cmp i bi then (n, ty, i) else (bn, bty, bi))
+                  first matches
               in
               let initial_n, ty, _ = pick ( < ) in
               let final_n, _, _ = pick ( > ) in
-              Some (reg, ty, initial_n, final_n)
+              (reg, ty, initial_n, final_n)
         )
         registers
     in
@@ -1140,22 +1171,34 @@ module Make (Config : CONFIG) = struct
        which argument. *)
     let arg_names = Stack.fold (fun m (k, v) -> (k, v) :: m) [] state.arg_stack in
     let arg_bindings =
-      List.filter_map
+      List.map
         (function
           | I_aux (I_decl (_, decl_name), (_, Unique (n, _))) -> (
               match List.assoc_opt n arg_names with
-              | None -> None
+              | None ->
+                  raise
+                    (Reporting.err_general Parse_ast.Unknown
+                       (Printf.sprintf "Could not recover transition argument %s"
+                          (string_of_name ~zencode:false decl_name)
+                       )
+                    )
               | Some mangled_str -> (
                   match
                     List.find_map
                       (function Declare_const (n2, ty) when zencode_name n2 = mangled_str -> Some ty | _ -> None)
                       entries
                   with
-                  | Some ty -> Some (decl_name, ty, mangled_str)
-                  | None -> None
+                  | Some ty -> (decl_name, ty, mangled_str)
+                  | None ->
+                      raise
+                        (Reporting.err_general Parse_ast.Unknown
+                           (Printf.sprintf "Could not recover the SMT sort of transition argument %s"
+                              (string_of_name ~zencode:false decl_name)
+                           )
+                        )
                 )
             )
-          | _ -> None
+          | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Expected a transition argument declaration"
           )
         arg_decls
     in
@@ -1168,8 +1211,7 @@ module Make (Config : CONFIG) = struct
       List.filter_map
         (fun (label, ev) ->
           let evstack = event_stack state ev in
-          if Stack.is_empty evstack then None
-          else Some (label, smt_disj (Stack.fold (fun xs x -> x :: xs) [] evstack))
+          if Stack.is_empty evstack then None else Some (label, smt_disj (Stack.fold (fun xs x -> x :: xs) [] evstack))
         )
         [("overflow", Overflow); ("assertion_failure", Assertion); ("match_failure", Match)]
     in
@@ -1181,7 +1223,9 @@ module Make (Config : CONFIG) = struct
     (* mangled internal name -> clean replacement, for every name that
        becomes a parameter of the relation. *)
     let param_subst =
-      List.map (fun (reg, _, initial_n, _) -> (zencode_name initial_n, Var (clean_id (register_label reg)))) register_bounds
+      List.map
+        (fun (reg, _, initial_n, _) -> (zencode_name initial_n, Var (clean_id (register_label reg))))
+        register_bounds
       @ List.map (fun (decl_name, _, mangled_str) -> (mangled_str, Var (clean_id (arg_label decl_name)))) arg_bindings
     in
     let consumed = List.map fst param_subst in
@@ -1205,6 +1249,23 @@ module Make (Config : CONFIG) = struct
     in
     let resolve exp = subst_vars inlined exp in
 
+    let return_value =
+      match ret_ctyp with
+      | CT_unit -> None
+      | _ ->
+          let returns = Stack.fold (fun values value -> value :: values) [] state.return_values in
+          let rec merge = function
+            | [] ->
+                raise
+                  (Reporting.err_general Parse_ast.Unknown
+                     (Printf.sprintf "Transition function %s has no recoverable return value" name)
+                  )
+            | [(_, value)] -> value
+            | (pathcond, value) :: remaining -> Ite (pathcond, value, merge remaining)
+          in
+          Some (resolve (merge returns))
+    in
+
     (* Any Declare_const that isn't a register pre-state or a resolved
        argument is a genuinely free value (e.g. from `undefined`) - a
        define-fun body can't contain an unbound declaration, so promote it
@@ -1217,7 +1278,11 @@ module Make (Config : CONFIG) = struct
     let side_condition_equalities =
       List.map (fun (label, exp) -> Fn ("=", [Var (clean_id label); resolve exp])) side_conditions
     in
-    let body = Fn ("and", register_equalities @ side_condition_equalities) in
+    let result_equalities =
+      match return_value with None -> [] | Some value -> [Fn ("=", [Var (clean_id "return_value"); value])]
+    in
+    let equalities = register_equalities @ result_equalities @ side_condition_equalities in
+    let body = Fn ("and", equalities) in
 
     (* Any Declare_const left over that isn't a register pre-state or a
        resolved argument is a genuinely free value (e.g. from `undefined`) -
@@ -1230,28 +1295,59 @@ module Make (Config : CONFIG) = struct
        nothing else would prune those. *)
     let used_names =
       let names = ref [] in
-      let collect = function Var v -> (names := zencode_name v :: !names; Var v) | e -> e in
-      List.iter (fun e -> ignore (fold_smt_exp collect e)) (register_equalities @ side_condition_equalities);
+      let collect = function
+        | Var v ->
+            names := zencode_name v :: !names;
+            Var v
+        | e -> e
+      in
+      List.iter (fun e -> ignore (fold_smt_exp collect e)) equalities;
       !names
     in
     let extra_params =
       List.filter_map
         (function
-          | Declare_const (n, ty) when (not (List.mem (zencode_name n) consumed)) && List.mem (zencode_name n) used_names
-            ->
+          | Declare_const (n, ty)
+            when (not (List.mem (zencode_name n) consumed)) && List.mem (zencode_name n) used_names ->
               Some (zencode_name n, ty)
           | _ -> None
           )
         entries
     in
 
-    let register_params = List.map (fun (reg, ty, _, _) -> (zencode_name (clean_id (register_label reg)), ty)) register_bounds in
-    let arg_params = List.map (fun (decl_name, ty, _) -> (zencode_name (clean_id (arg_label decl_name)), ty)) arg_bindings in
+    let register_params =
+      List.map (fun (reg, ty, _, _) -> (zencode_name (clean_id (register_label reg)), ty)) register_bounds
+    in
+    let arg_params =
+      List.map (fun (decl_name, ty, _) -> (zencode_name (clean_id (arg_label decl_name)), ty)) arg_bindings
+    in
     let register_next_params =
       List.map (fun (reg, ty, _, _) -> (zencode_name (clean_id (register_label reg ^ "_next")), ty)) register_bounds
     in
+    let result_params =
+      match return_value with
+      | None -> []
+      | Some _ ->
+          let result_type, _ = Smt_gen.run (smt_ctyp ret_ctyp) Parse_ast.Unknown ctx in
+          [(zencode_name (clean_id "return_value"), result_type)]
+    in
     let side_condition_params = List.map (fun (label, _) -> (zencode_name (clean_id label), Bool)) side_conditions in
-    let params = register_params @ arg_params @ extra_params @ register_next_params @ side_condition_params in
+    let params =
+      register_params @ arg_params @ extra_params @ register_next_params @ result_params @ side_condition_params
+    in
+
+    let parameter_names = List.map fst params in
+    let rec reject_duplicate = function
+      | [] -> ()
+      | parameter :: remaining ->
+          if List.mem parameter remaining then
+            raise
+              (Reporting.err_general Parse_ast.Unknown
+                 (Printf.sprintf "Transition %s has duplicate SMT parameter name %s" name parameter)
+              );
+          reject_duplicate remaining
+    in
+    reject_duplicate parameter_names;
 
     let fname = name_file name in
     let out_chan = open_out fname in
@@ -1264,7 +1360,49 @@ module Make (Config : CONFIG) = struct
       header;
     output_string out_chan (string_of_smt_def (Define_fun (name, params, Bool, body)));
     output_string out_chan "\n";
-    close_out out_chan
+    close_out out_chan;
+
+    let parameter role source_name (smt_name, smt_type) =
+      (role, source_name, smt_name, Smt_exp.string_of_smt_typ smt_type)
+    in
+    let parameter_data =
+      List.map
+        (fun (reg, ty, _, _) ->
+          parameter Smt_transition_interface.State_pre
+            (Some (register_label reg))
+            (zencode_name (clean_id (register_label reg)), ty)
+        )
+        register_bounds
+      @ List.map2
+          (fun source_name (decl_name, ty, _) ->
+            parameter Smt_transition_interface.Input source_name (zencode_name (clean_id (arg_label decl_name)), ty)
+          )
+          arg_source_names arg_bindings
+      @ List.map
+          (fun (smt_name, ty) -> parameter Smt_transition_interface.Nondet_input None (smt_name, ty))
+          extra_params
+      @ List.map
+          (fun (reg, ty, _, _) ->
+            parameter Smt_transition_interface.State_post
+              (Some (register_label reg))
+              (zencode_name (clean_id (register_label reg ^ "_next")), ty)
+          )
+          register_bounds
+      @ List.map (fun result -> parameter Smt_transition_interface.Result (Some "result") result) result_params
+      @ List.map
+          (fun (label, _) ->
+            parameter Smt_transition_interface.Side_condition (Some label) (zencode_name (clean_id label), Bool)
+          )
+          side_conditions
+    in
+    let parameters =
+      List.mapi
+        (fun position (role, source_name, smt_name, smt_sort) ->
+          Smt_transition_interface.{ position; source_name; smt_name; smt_sort; role }
+        )
+        parameter_data
+    in
+    { file_name = fname; function_id; parameters }
 end
 
 module CompileConfig (Opts : sig

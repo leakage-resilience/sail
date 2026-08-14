@@ -1029,6 +1029,8 @@ let rec pp_smt_typ =
   | Datatype (name, _) -> string name
   | Array (ty1, ty2) -> pp_sfun "Array" [pp_smt_typ ty1; pp_smt_typ ty2]
 
+let string_of_smt_typ typ = Pretty_print_sail.Document.to_string (pp_smt_typ typ)
+
 let pp_str_smt_typ (str, ty) =
   let open PPrint in
   parens (string str ^^ space ^^ pp_smt_typ ty)

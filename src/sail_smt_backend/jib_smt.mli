@@ -73,6 +73,12 @@ module Make (Config : CONFIG) : sig
     arg_smt_names : (name * string option) list;
   }
 
+  type generated_transition_info = {
+    file_name : string;
+    function_id : id;
+    parameters : Smt_transition_interface.parameter list;
+  }
+
   (** Generate SMT for all the $property and $counterexample pragmas provided, and write the generated SMT to
       appropriately named files. *)
   val generate_smt :
@@ -87,19 +93,23 @@ module Make (Config : CONFIG) : sig
       [Bool] named after the function. Its parameters are, in order:
       - each architectural register's pre-state value, named after the register (zencoded, e.g. [zR1]),
       - each function argument, named after its Sail-level parameter name,
+      - each additional nondeterministic input needed by the transition,
       - each architectural register's post-state value, named [<register>_next],
-      - a [Bool] parameter per side condition that can actually occur - [overflow], [assertion_failure],
-        [match_failure] - omitted entirely when it cannot occur.
+      - the function result, named [return_value], unless the function returns [unit],
+      - a [Bool] parameter per side condition that can actually occur - [overflow], [assertion_failure], [match_failure]
+        \- omitted entirely when it cannot occur.
 
-      The body is a flat conjunction of equalities, one per post-state/side-condition parameter, each pinning it to
-      its computed value (every intermediate value from the underlying SSA walk is inlined by substitution, since
-      Smt_exp has no let-binding node). *)
+      The body is a flat conjunction of equalities, one per post-state/result/side-condition parameter, each pinning it
+      to its computed value (every intermediate value from the underlying SSA walk is inlined by substitution, since
+      Smt_exp has no let-binding node). The returned metadata is sufficient to emit the mandatory transition interface
+      manifest. *)
   val generate_transition :
     name_file:(string -> string) (** Applied to the function name to generate the file name for the smtlib file *) ->
+    arg_source_names:string option list (** Source names for the selected function's parameters *) ->
     Jib_compile.ctx ->
     cdef list ->
     string ->
-    unit
+    generated_transition_info
 end
 
 val compile :
