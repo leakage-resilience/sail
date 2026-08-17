@@ -8,7 +8,7 @@
 
 (executable
  (name sail_plugin_smt)
- (modules sail_plugin_smt jib_smt jib_ir smt_transition_interface)
+ (modules sail_plugin_smt jib_smt jib_ir)
  (modes
   (native plugin)
   (byte plugin))

@@ -856,8 +856,6 @@ module Make (Config : CONFIG) = struct
     arg_smt_names : (name * string option) list;
   }
 
-  type generated_transition_info = { file_name : string; function_id : id }
-
   let smt_cdef props lets name_file ctx all_cdefs smt_includes (CDEF_aux (aux, def_annot)) =
     match aux with
     | CDEF_val (function_id, _, arg_ctyps, ret_ctyp, _) when Bindings.mem function_id props -> (
@@ -1089,7 +1087,7 @@ module Make (Config : CONFIG) = struct
   (* Generate a function's SMT transition relation: a single quantifier-free
      define-fun asserting how its post-state (and any side conditions) relate
      to its pre-state and arguments. See jib_smt.mli for the exact shape. *)
-  let generate_transition ~name_file ~arg_source_names ctx cdefs name =
+  let generate_transition ~name_file ctx cdefs name =
     let all_cdefs = visit_cdefs (new expand_reg_deref_visitor ctx.tc_env) cdefs in
     let lets, function_id, arg_ctyps, ret_ctyp =
       match find_val_spec [] name all_cdefs with
@@ -1102,11 +1100,6 @@ module Make (Config : CONFIG) = struct
       | intervening_lets, Some (Return_plain, args, instrs, _) -> (intervening_lets, args, instrs)
       | _ -> raise (Reporting.err_general Parse_ast.Unknown ("No function body found for " ^ name))
     in
-    if List.compare_lengths arg_source_names args <> 0 then
-      raise
-        (Reporting.err_general Parse_ast.Unknown
-           (Printf.sprintf "Could not recover all source arguments for transition %s" name)
-        );
     let arg_decls = List.map2 (fun id ctyp -> idecl (unique Parse_ast.Unknown) ctyp id) args arg_ctyps in
     let full_instrs =
       let open Jib_optimize in
@@ -1345,22 +1338,6 @@ module Make (Config : CONFIG) = struct
     in
     reject_duplicate parameter_names;
 
-    let parameter_data =
-      List.map (fun (reg, _, _, _) -> (Smt_transition_interface.State_pre, Some (register_label reg))) register_bounds
-      @ List.map2 (fun source_name _ -> (Smt_transition_interface.Input, source_name)) arg_source_names arg_bindings
-      @ List.map (fun _ -> (Smt_transition_interface.Nondet_input, None)) extra_params
-      @ List.map
-          (fun (reg, _, _, _) -> (Smt_transition_interface.State_post, Some (register_label reg)))
-          register_bounds
-      @ List.map (fun _ -> (Smt_transition_interface.Result, Some "result")) result_params
-      @ List.map (fun (label, _) -> (Smt_transition_interface.Side_condition, Some label)) side_conditions
-    in
-    let parameters =
-      List.mapi
-        (fun position (role, source_name) -> Smt_transition_interface.{ position; source_name; role })
-        parameter_data
-    in
-
     let fname = name_file name in
     let out_chan = open_out fname in
     let header, _ = Smt_gen.run (smt_header all_cdefs) Parse_ast.Unknown ctx in
@@ -1370,11 +1347,9 @@ module Make (Config : CONFIG) = struct
         output_string out_chan "\n"
       )
       header;
-    Smt_transition_interface.write out_chan ~transition:(Ast_util.string_of_id function_id) parameters;
     output_string out_chan (string_of_smt_def (Define_fun (name, params, Bool, body)));
     output_string out_chan "\n";
-    close_out out_chan;
-    { file_name = fname; function_id }
+    close_out out_chan
 end
 
 module CompileConfig (Opts : sig

@@ -73,8 +73,6 @@ module Make (Config : CONFIG) : sig
     arg_smt_names : (name * string option) list;
   }
 
-  type generated_transition_info = { file_name : string; function_id : id }
-
   (** Generate SMT for all the $property and $counterexample pragmas provided, and write the generated SMT to
       appropriately named files. *)
   val generate_smt :
@@ -97,15 +95,14 @@ module Make (Config : CONFIG) : sig
 
       The body is a flat conjunction of equalities, one per post-state/result/side-condition parameter, each pinning it
       to its computed value (every intermediate value from the underlying SSA walk is inlined by substitution, since
-      Smt_exp has no let-binding node). Versioned [set-info] commands embedded immediately before the [define-fun]
-      record each formal parameter's semantic role and recoverable Sail source name. *)
+      Smt_exp has no let-binding node). The z-encoded formal names, their order, and their sorts form the transition's
+      complete interface. *)
   val generate_transition :
     name_file:(string -> string) (** Applied to the function name to generate the file name for the smtlib file *) ->
-    arg_source_names:string option list (** Source names for the selected function's parameters *) ->
     Jib_compile.ctx ->
     cdef list ->
     string ->
-    generated_transition_info
+    unit
 end
 
 val compile :
