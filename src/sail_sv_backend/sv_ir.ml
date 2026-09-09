@@ -214,6 +214,7 @@ let rec visit_smt_exp (vis : svir_visitor) outer_smt_exp =
     | Unwrap (ctor, b, exp) ->
         let exp' = visit_smt_exp vis exp in
         if exp == exp' then no_change else Unwrap (ctor, b, exp')
+    | Let _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Let binding cannot be expressed in SystemVerilog"
     | Bool_lit _ | Bitvec_lit _ | Real_lit _ | String_lit _ | Unit | Member _ | Empty_list -> no_change
   in
   do_visit vis (vis#vsmt_exp outer_smt_exp) aux outer_smt_exp

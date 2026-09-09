@@ -544,6 +544,7 @@ module RemoveUnusedVariables = struct
         smt_uses ~propagated stack uses i;
         smt_uses ~propagated stack uses x
     | Struct (_, fields) -> List.iter (fun (_, exp) -> smt_uses ~propagated stack uses exp) fields
+    | Let _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Let binding cannot be expressed in SystemVerilog"
 
   let rec place_uses ?(output = false) stack uses = function
     | SVP_id name -> add_use ~write:true ~output name stack uses

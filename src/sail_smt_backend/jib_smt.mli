@@ -82,6 +82,13 @@ module Make (Config : CONFIG) : sig
     Jib_compile.ctx ->
     cdef list ->
     generated_smt_info list
+
+  (** Generate a SMT transition relation of type Bool named after the given function. Its parameters are, in order:
+      - each architectural register's pre-state value, named after the register, e.g. [|R1|],
+      - each function argument, named after its Sail-level parameter name, e.g. [|opcode|]
+      - each architectural register's post-state value, named [|<register>_next|],
+      - a [Bool] parameter per side condition [|overflow|], [|assertion_failure|], and [|match_failure|]. *)
+  val generate_transition : out_file:string -> Jib_compile.ctx -> cdef list -> string -> unit
 end
 
 val compile :

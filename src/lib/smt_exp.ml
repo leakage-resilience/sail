@@ -91,6 +91,7 @@ type smt_exp =
   | Empty_list
   | Hd of string * smt_exp
   | Tl of string * smt_exp
+  | Let of (Jib.name * smt_exp) list * smt_exp
 
 let rec pp_smt_exp =
   let open PPrint in
@@ -117,6 +118,10 @@ let rec pp_smt_exp =
   | Store (_, _, arr, index, x) -> parens (string "store" ^^ space ^^ separate_map space pp_smt_exp [arr; index; x])
   | Hd (op, exp) | Tl (op, exp) -> parens (string op ^^ space ^^ pp_smt_exp exp)
   | Empty_list -> string "empty_list"
+  | Let ([], body) -> pp_smt_exp body
+  | Let (bindings, body) ->
+      let pp_binding (v, exp) = parens (string (zencode_name v) ^^ space ^^ pp_smt_exp exp) in
+      parens (string "let" ^^ space ^^ parens (separate_map space pp_binding bindings) ^^ space ^^ pp_smt_exp body)
 
 let var_id id = Var (Name (id, -1))
 
@@ -133,6 +138,7 @@ let rec fold_smt_exp f = function
       f (Store (info, store_fn, fold_smt_exp f arr, fold_smt_exp f index, fold_smt_exp f x))
   | Hd (hd_op, xs) -> f (Hd (hd_op, fold_smt_exp f xs))
   | Tl (tl_op, xs) -> f (Tl (tl_op, fold_smt_exp f xs))
+  | Let (bindings, body) -> f (Let (List.map (fun (v, exp) -> (v, fold_smt_exp f exp)) bindings, fold_smt_exp f body))
   | Struct (struct_id, fields) ->
       f (Struct (struct_id, List.map (fun (field_id, exp) -> (field_id, fold_smt_exp f exp)) fields))
   | (Bool_lit _ | Bitvec_lit _ | Real_lit _ | String_lit _ | Var _ | Unit | Member _ | Empty_list) as exp -> f exp
@@ -159,6 +165,9 @@ let rec iter_smt_exp f exp =
       iter_smt_exp f index;
       iter_smt_exp f exp
   | Struct (_, fields) -> List.iter (fun (_, field) -> iter_smt_exp f field) fields
+  | Let (bindings, body) ->
+      List.iter (fun (_, exp) -> iter_smt_exp f exp) bindings;
+      iter_smt_exp f body
   | Bool_lit _ | Bitvec_lit _ | Real_lit _ | String_lit _ | Var _ | Unit | Member _ | Empty_list -> ()
 
 let rec smt_exp_size = function
@@ -175,6 +184,7 @@ let rec smt_exp_size = function
       1 + smt_exp_size exp
   | Store (_, _, arr, index, exp) -> 1 + smt_exp_size arr + smt_exp_size index + smt_exp_size exp
   | Struct (_, fields) -> 1 + List.fold_left (fun n (_, field) -> n + smt_exp_size field) 0 fields
+  | Let (bindings, body) -> 1 + List.fold_left (fun n (_, exp) -> n + smt_exp_size exp) 0 bindings + smt_exp_size body
   | Bool_lit _ | Bitvec_lit _ | Real_lit _ | String_lit _ | Var _ | Unit | Member _ | Empty_list -> 1
 
 let extract ~from i j x = Extract (i, j, from, x)
@@ -938,6 +948,10 @@ module Simplifier = struct
       | Struct (struct_id, fields) ->
           let fields' = map_no_copy (fun (field_id, exp) -> (field_id, go simpset exp)) fields in
           if fields == fields' then no_change else Struct (struct_id, fields')
+      | Let (bindings, body) ->
+          let bindings' = map_no_copy (fun (v, exp) -> (v, go simpset exp)) bindings in
+          let body' = go simpset body in
+          if bindings == bindings' && body == body' then no_change else Let (bindings', body')
       | Bool_lit _ | Bitvec_lit _ | Real_lit _ | String_lit _ | Var _ | Unit | Member _ | Empty_list -> no_change
     in
     let exp = go simpset exp in

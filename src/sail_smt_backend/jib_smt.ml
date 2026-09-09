@@ -129,6 +129,9 @@ module Make_optimizer (S : Sequence) = struct
           uses_in_exp index;
           uses_in_exp x
       | Struct (_, fields) -> List.iter (fun (_, field) -> uses_in_exp field) fields
+      | Let (bindings, body) ->
+          List.iter (fun (_, exp) -> uses_in_exp exp) bindings;
+          uses_in_exp body
     in
 
     let remove_unused () = function
@@ -1054,6 +1057,201 @@ module Make (Config : CONFIG) = struct
   let generate_smt ~properties ~name_file ~smt_includes ctx cdefs =
     let cdefs = visit_cdefs (new expand_reg_deref_visitor ctx.tc_env) cdefs in
     smt_cdefs [] properties [] name_file ctx cdefs smt_includes cdefs
+
+  (* Mirrors find_function, but locates a function by plain name via its
+     CDEF_val rather than by id via a props map. *)
+  let rec find_val_spec lets fn_name = function
+    | CDEF_aux (CDEF_val (id, _, arg_ctyps, _, _), _) :: _ when string_of_id id = fn_name -> Some (lets, id, arg_ctyps)
+    | CDEF_aux (CDEF_let (_, vars, setup), _) :: cdefs ->
+        let vars = List.map (fun (id, ctyp) -> idecl (id_loc id) ctyp (name id)) vars in
+        find_val_spec (lets @ vars @ setup) fn_name cdefs
+    | _ :: cdefs -> find_val_spec lets fn_name cdefs
+    | [] -> None
+
+  (* Replace every Var whose zencoded name is a key of table with its
+     replacement expression. Keyed by the rendered string rather than
+     structural Jib.name equality so it applies uniformly regardless of
+     which mechanism found the replacement (SSA base-name matching for
+     registers, the arg_stack for arguments). *)
+  let subst_vars table = fold_smt_exp (function Var v -> Option.value ~default:(Var v) (List.assoc_opt (zencode_name v) table) | e -> e)
+
+  (* Generate a function's SMT transition relation: a single quantifier-free
+     define-fun asserting how its post-state (and any side conditions) relate
+     to its pre-state and arguments. See jib_smt.mli for the exact shape. *)
+  let generate_transition ~out_file ctx cdefs name =
+    let all_cdefs = visit_cdefs (new expand_reg_deref_visitor ctx.tc_env) cdefs in
+    let lets, function_id, arg_ctyps =
+      match find_val_spec [] name all_cdefs with
+      | Some v -> v
+      | None ->
+          raise (Reporting.err_general Parse_ast.Unknown ("Could not find function " ^ name ^ " for -smt_transition"))
+    in
+    let intervening_lets, args, instrs =
+      match find_function [] function_id all_cdefs with
+      | intervening_lets, Some (Return_plain, args, instrs, _) -> (intervening_lets, args, instrs)
+      | _ -> raise (Reporting.err_general Parse_ast.Unknown ("No function body found for " ^ name))
+    in
+    let arg_decls = List.map2 (fun id ctyp -> idecl (unique Parse_ast.Unknown) ctyp id) args arg_ctyps in
+    let full_instrs =
+      let open Jib_optimize in
+      lets @ intervening_lets @ arg_decls @ instrs
+      |> inline all_cdefs (fun _ -> true)
+      |> flatten_instrs |> remove_unused_labels |> remove_pointless_goto
+    in
+    let (stack, state), _ = Smt_gen.run (smt_instr_list None name ctx all_cdefs full_instrs) Parse_ast.Unknown ctx in
+
+    (* Stack.fold visits top-to-bottom (newest first); consing onto the
+       accumulator as we go yields the list in program (oldest-first) order. *)
+    let entries = Stack.fold (fun acc def -> def :: acc) [] stack in
+
+    let registers =
+      List.filter_map (function CDEF_aux (CDEF_register (reg, _, _), _) -> Some reg | _ -> None) all_cdefs
+    in
+    (* For each register, the lowest (pre-state) and highest (post-state)
+       SSA'd occurrence among the stack entries, matched by base name. *)
+    let register_bounds =
+      List.filter_map
+        (fun reg ->
+          let base, _ = Jib_ssa.unssa_name reg in
+          let matches =
+            List.filter_map
+              (function
+                | (Declare_const (n, ty) | Define_const (n, ty, _)) as _def ->
+                    let b, i = Jib_ssa.unssa_name n in
+                    if Name.compare b base = 0 then Some (n, ty, i) else None
+                | _ -> None
+                )
+              entries
+          in
+          match matches with
+          | [] -> None
+          | first :: _ ->
+              let pick cmp =
+                List.fold_left (fun (bn, bty, bi) (n, ty, i) -> if cmp i bi then (n, ty, i) else (bn, bty, bi)) first matches
+              in
+              let initial_n, ty, _ = pick ( < ) in
+              let final_n, _, _ = pick ( > ) in
+              Some (reg, ty, initial_n, final_n)
+        )
+        registers
+    in
+
+    (* Arguments: resolve each arg_decl's assigned SSA'd name via the same
+       Unique-location/arg_stack mechanism the $property path uses - ordinary
+       local variables, unlike registers, are not given an SSA-recoverable
+       base name, so this is the only way to find which mangled symbol is
+       which argument. *)
+    let arg_names = Stack.fold (fun m (k, v) -> (k, v) :: m) [] state.arg_stack in
+    let arg_bindings =
+      List.filter_map
+        (function
+          | I_aux (I_decl (_, decl_name), (_, Unique (n, _))) -> (
+              match List.assoc_opt n arg_names with
+              | None -> None
+              | Some mangled_str -> (
+                  match
+                    List.find_map
+                      (function Declare_const (n2, ty) when zencode_name n2 = mangled_str -> Some ty | _ -> None)
+                      entries
+                  with
+                  | Some ty -> Some (decl_name, ty, mangled_str)
+                  | None -> None
+                )
+            )
+          | _ -> None
+          )
+        arg_decls
+    in
+
+    (* Side conditions: same event machinery smt_query uses, just not
+       queried/asserted here - each becomes an extra output parameter. One that
+       cannot occur has no events, and smt_disj pins it to false, so the
+       relation keeps a fixed arity. *)
+    let side_conditions =
+      List.map
+        (fun (label, ev) -> (label, smt_disj (Stack.fold (fun xs x -> x :: xs) [] (event_stack state ev))))
+        [("overflow", Overflow); ("assertion_failure", Assertion); ("match_failure", Match)]
+    in
+
+    (* Abstract is the one name variant string_of_name renders verbatim, so the
+       parameter list and the body's Vars agree without zencoding either. Sail
+       identifiers admit ' and #, which are not legal in an SMT-LIB simple
+       symbol, so quote unconditionally rather than only when needed. *)
+    let clean_id label = Abstract (mk_id ("|" ^ label ^ "|")) in
+    let register_label reg = string_of_name ~zencode:false reg in
+    let arg_label decl_name = string_of_name ~zencode:false decl_name in
+
+    (* mangled internal name -> clean replacement, for every name that
+       becomes a parameter of the relation. *)
+    let param_subst =
+      List.map (fun (reg, _, initial_n, _) -> (zencode_name initial_n, Var (clean_id (register_label reg)))) register_bounds
+      @ List.map (fun (decl_name, _, mangled_str) -> (mangled_str, Var (clean_id (arg_label decl_name)))) arg_bindings
+    in
+    (* Rename to the parameter names before optimizing rather than after, so
+       the define-consts that only held an argument or a register's pre-state
+       fall out as dead code along with everything else unreachable. *)
+    let renamed = Stack.create () in
+    List.iter
+      (fun def ->
+        Stack.push
+          (match def with Define_const (n, ty, exp) -> Define_const (n, ty, subst_vars param_subst exp) | def -> def)
+          renamed
+      )
+      entries;
+
+    let register_equalities =
+      List.map
+        (fun (reg, _, _, final_n) ->
+          Fn ("=", [Var (clean_id (register_label reg ^ "_next")); subst_vars param_subst (Var final_n)])
+        )
+        register_bounds
+    in
+    let side_condition_equalities =
+      List.map (fun (label, exp) -> Fn ("=", [Var (clean_id label); subst_vars param_subst exp])) side_conditions
+    in
+    (* Pushed as an Assert so Queue_optimizer takes the conjunction as its
+       root: it then prunes what the relation cannot reach, constant-folds,
+       and inlines the single-use intermediates. *)
+    Stack.push (Assert (Fn ("and", register_equalities @ side_condition_equalities))) renamed;
+    let optimized = Queue_optimizer.optimize renamed |> Queue.to_seq |> List.of_seq in
+
+    (* Every intermediate that survives becomes a let binding. Whatever is
+       still only declared is a genuinely free value (e.g. from `undefined`);
+       a define-fun body cannot contain a declaration, so promote it to an
+       extra input parameter under its own name. *)
+    let bindings = List.filter_map (function Define_const (n, _, exp) -> Some (n, exp) | _ -> None) optimized in
+    let body =
+      match List.filter_map (function Assert exp -> Some exp | _ -> None) optimized with
+      (* Each binding refers to the ones before it, so they cannot share a
+         single group, whose bindings are parallel. *)
+      | [exp] -> List.fold_right (fun binding body -> Let ([binding], body)) bindings exp
+      | _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "transition relation lost its body"
+    in
+    let extra_params =
+      List.filter_map (function Declare_const (n, ty) -> Some (zencode_name n, ty) | _ -> None) optimized
+    in
+    let extra_defs = List.filter (function Declare_datatypes _ | Declare_fun _ -> true | _ -> false) optimized in
+
+    let register_params = List.map (fun (reg, ty, _, _) -> (zencode_name (clean_id (register_label reg)), ty)) register_bounds in
+    let arg_params = List.map (fun (decl_name, ty, _) -> (zencode_name (clean_id (arg_label decl_name)), ty)) arg_bindings in
+    let register_next_params =
+      List.map (fun (reg, ty, _, _) -> (zencode_name (clean_id (register_label reg ^ "_next")), ty)) register_bounds
+    in
+    let side_condition_params = List.map (fun (label, _) -> (zencode_name (clean_id label), Bool)) side_conditions in
+    let params = register_params @ arg_params @ extra_params @ register_next_params @ side_condition_params in
+
+    let out_chan = open_out out_file in
+    let header, _ = Smt_gen.run (smt_header all_cdefs) Parse_ast.Unknown ctx in
+    List.iter
+      (fun def ->
+        output_string out_chan (string_of_smt_def def);
+        output_string out_chan "\n"
+      )
+      (header @ extra_defs);
+    (* Quoted for the same reason as the parameters *)
+    output_string out_chan (string_of_smt_def (Define_fun ("|" ^ name ^ "|", params, Bool, body)));
+    output_string out_chan "\n";
+    close_out out_chan
 end
 
 module CompileConfig (Opts : sig

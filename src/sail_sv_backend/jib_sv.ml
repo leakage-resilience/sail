@@ -660,6 +660,7 @@ module Make (Config : CONFIG) = struct
         | None -> string op ^^ parens (pp_smt arg)
       )
     | Tl (op, arg) -> string op ^^ parens (pp_smt arg)
+    | Let _ -> Reporting.unreachable Parse_ast.Unknown __POS__ "Let binding cannot be expressed in SystemVerilog"
     | _ -> empty
 
   let sv_cval cval =
